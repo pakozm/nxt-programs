@@ -1,0 +1,56 @@
+// AUTHORS: Joan Climent Ciscar, Francisco Zamora Martinez
+// YEAR:    2011
+#define THRESHOLD_WHITE		50	// umbral blanco
+#define THRESHOLD_BLACK		45	// umbral negro
+#define THRESHOLD_BLACK2        30      // umbral para cuando va a toda pastilla
+#define COUNTER_CLOCKWISE	-1	// flag para giro a izquierdas
+#define CLOCKWISE		 1	// flag para giro a derechas
+#define RIGHT_SENSOR		IN_2
+#define LEFT_SENSOR		IN_3
+#define RIGHT_MOTOR		OUT_B
+#define LEFT_MOTOR		OUT_A
+#define BOTH_MOTORS		OUT_AB
+
+#define MIN_SPEED	25
+#define NORMAL_SPEED	35
+#define NITRO		70
+#define TIME_FOR_NITRO 800
+
+#define TURN_SPEED	30	// Velocidad en los giros
+#define TURN_DEGREE	10	// Controla la duracion del giro
+#define TURN_STEER      70	// Controla el espacio necesario para girar
+                                // (100 para giro sobre su propio eje)
+
+#define turn(direction) \
+  RotateMotorEx(BOTH_MOTORS, TURN_SPEED, TURN_DEGREE, TURN_STEER*(direction), true, false)
+
+task main()
+{
+  SetSensorLight( LEFT_SENSOR );    // sensor de luz izquierdo
+  SetSensorLight( RIGHT_SENSOR );   // sensor de luz derecho
+  long t0, timer;
+  int current_speed = NORMAL_SPEED;
+  t0 = CurrentTick();
+  while (true) {
+    // Leemos los sensores una unica vez, evitamos que entre una
+    // lectura y otra pueda haber diferencias
+    int right_value = Sensor( RIGHT_SENSOR );
+    int left_value  = Sensor( LEFT_SENSOR );
+    if (current_speed > NORMAL_SPEED) {
+      if (right_value < THRESHOLD_BLACK2 || left_value < THRESHOLD_BLACK2)
+	t0 = CurrentTick();
+    }
+    else if (right_value<THRESHOLD_BLACK || left_value<THRESHOLD_BLACK)
+      t0 = CurrentTick();
+    timer = CurrentTick()-t0;
+    // si en .8 segundos ha ido recto, pone el NITRO ;)
+    if (timer > TIME_FOR_NITRO) current_speed = NITRO;
+    else current_speed = NORMAL_SPEED;
+    // Giramos en caso de que se pierda la linea
+    if (right_value<THRESHOLD_BLACK && left_value>THRESHOLD_WHITE)
+      turn( CLOCKWISE );
+    else if(right_value>THRESHOLD_WHITE && left_value<THRESHOLD_BLACK)
+      turn( COUNTER_CLOCKWISE );
+    else OnFwd(BOTH_MOTORS, current_speed);
+  }  
+}

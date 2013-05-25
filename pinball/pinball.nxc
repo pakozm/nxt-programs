@@ -1,0 +1,377 @@
+
+#define LEFT_SLIDE		IN_3
+#define RIGHT_SLIDE		IN_4
+#define LEFT_SLIDE_M		OUT_A
+#define RIGHT_SLIDE_M		OUT_B
+#define ROTATION_THING		OUT_C
+#define SCORE_SENSOR		IN_1
+#define GAME_OVER_SENSOR	IN_2
+#define COLOR_THRESHOLD		15
+#define INITIAL_NUMBER_OF_BALLS 3
+#define THRESHOLD		50
+#define EXTRA_BALL_SCORE	20
+#define TIME_TO_STOP_SLIDE	50
+#define MAX_SLIDE_ROT		10
+
+#define SlideUp(slide)   OnFwd(slide,  100);
+#define SlideDown(slide) OnFwd(slide, -100);
+
+#define NUM_FLASHES 5
+#define CHAR_WIDTH 12
+
+// estado del juego
+struct Game_state{
+  long  score;
+  long  num_balls;
+  bool  playing;
+  bool  score_sensor;
+  bool  game_over_sensor;
+  bool  left_slide;
+  bool  right_slide;
+  mutex data_mutex;
+  mutex play_mutex;
+};
+
+#define NEGRA_D 200
+#define NEGRA_W 400
+#define CORCHEA_D 100
+#define CORCHEA_W 200
+
+long music_tones[]     = {
+  TONE_E5, TONE_D5,   TONE_B4, TONE_C5, TONE_D5,   TONE_B4, TONE_C5, TONE_D5,   TONE_C5, TONE_B4, TONE_A4,
+  TONE_E5, TONE_D5,   TONE_B4, TONE_C5, TONE_D5,   TONE_E5,          TONE_C5,   TONE_A4,          TONE_A4,
+  TONE_E5, TONE_D5,   TONE_B4, TONE_C5, TONE_D5,   TONE_B4, TONE_C5, TONE_D5,   TONE_C5, TONE_B4, TONE_A4,
+  TONE_E5, TONE_D5,   TONE_B4, TONE_C5, TONE_D5,   TONE_E5,          TONE_C5,   TONE_A4,          TONE_A4,
+  //
+  TONE_D5, TONE_F5,   TONE_A5, TONE_G5, TONE_F5,   TONE_E5, TONE_C5, TONE_E5, TONE_D5,
+  TONE_C5, TONE_B4,   TONE_B4, TONE_C5, TONE_D5,   TONE_E5,          TONE_C5,   TONE_A4,          TONE_A4
+};
+long music_durations[] = {
+  NEGRA_D, NEGRA_D, CORCHEA_D, CORCHEA_D, NEGRA_D, CORCHEA_D, CORCHEA_D, NEGRA_D, CORCHEA_D, CORCHEA_D, NEGRA_D,
+  NEGRA_D, NEGRA_D, CORCHEA_D, CORCHEA_D, NEGRA_D, NEGRA_D,   NEGRA_D,   NEGRA_D, NEGRA_D,
+  NEGRA_D, NEGRA_D, CORCHEA_D, CORCHEA_D, NEGRA_D, CORCHEA_D, CORCHEA_D, NEGRA_D, CORCHEA_D, CORCHEA_D, NEGRA_D,
+  NEGRA_D, NEGRA_D, CORCHEA_D, CORCHEA_D, NEGRA_D, NEGRA_D,   NEGRA_D,   NEGRA_D, NEGRA_D,
+  //
+  NEGRA_D, NEGRA_D, NEGRA_D,              CORCHEA_D, CORCHEA_D, NEGRA_D,   CORCHEA_D, CORCHEA_D, NEGRA_D,
+  NEGRA_D, NEGRA_D, CORCHEA_D, CORCHEA_D, NEGRA_D, NEGRA_D,   NEGRA_D,   NEGRA_D, NEGRA_D
+};
+long music_waits[]     = {
+  NEGRA_W, NEGRA_W, CORCHEA_W, CORCHEA_W, NEGRA_W, CORCHEA_W, CORCHEA_W, NEGRA_W, CORCHEA_W, CORCHEA_W, NEGRA_W,
+  NEGRA_W, NEGRA_W, CORCHEA_W, CORCHEA_W, NEGRA_W, NEGRA_W,   NEGRA_W,   NEGRA_W, NEGRA_W,
+  NEGRA_W, NEGRA_W, CORCHEA_W, CORCHEA_W, NEGRA_W, CORCHEA_W, CORCHEA_W, NEGRA_W, CORCHEA_W, CORCHEA_W, NEGRA_W,
+  NEGRA_W, NEGRA_W, CORCHEA_W, CORCHEA_W, NEGRA_W, NEGRA_W,   NEGRA_W,   NEGRA_W, NEGRA_W,
+  //
+  NEGRA_W, NEGRA_W, NEGRA_W,              CORCHEA_W, CORCHEA_W, NEGRA_W,   CORCHEA_W, CORCHEA_W, NEGRA_W,
+  NEGRA_W, NEGRA_W, CORCHEA_W, CORCHEA_W, NEGRA_W, NEGRA_W,   NEGRA_W,   NEGRA_W, NEGRA_W
+};
+int	music_size     = 58;
+
+Game_state game;
+
+void initGame(){
+  game.score		= 0;
+  game.num_balls	= INITIAL_NUMBER_OF_BALLS;
+  game.playing		= true;
+  game.score_sensor	= false;
+  game.game_over_sensor = false;
+  game.left_slide	= false;
+  game.right_slide	= false;
+}
+
+void playMusic(long music[], long durations[], long waits[], long size) {
+  for (long i=0; i<size && game.playing; ++i) {
+    Acquire(game.play_mutex);
+    PlayToneEx(music[i], durations[i], 5, false);
+    Release(game.play_mutex);
+    Wait(waits[i]);
+  }
+}
+
+void printString( string s, int x, int y, int space){
+  int char_width = 15;
+  int posx  = x;
+  long sz   = StrLen(s);
+  byte index[1];
+  for( long i=0; i<sz; i++ )
+    {
+      if (s[i] != ' ') {
+     	index[0] = s[i] ;
+	GraphicOutEx(posx,y, "font.ric", index);
+
+	posx += CHAR_WIDTH + space;
+      }
+    }
+}
+
+
+void displayFlashScreen(){
+  int i=1;
+  for(int j = 0; j<NUM_FLASHES; ++j){
+    if( (i =-i) <0)
+      RectOut(0,0,100,80, DRAW_OPT_FILL_SHAPE);
+    else
+      RectOut(0,0,100,80, DRAW_OPT_CLEAR_WHOLE_SCREEN);
+    Wait(100);
+  }
+  ClearLine(LCD_LINE5);
+  ClearLine(LCD_LINE4);
+  ClearLine(LCD_LINE3);
+  ClearLine(LCD_LINE2);
+  ClearLine(LCD_LINE1);
+
+  ClearScreen();
+  printString( "SCORE", 0,50,0);
+  printString("BALLS", 0,0,0);
+}
+
+void gameOverTone(){
+  TextOut(5, LCD_LINE6, "**** GAME OVER *****");
+  Acquire(game.play_mutex);
+  PlayTone(TONE_F4,  400); Wait(500);
+  PlayTone(TONE_DS4, 400); Wait(500);
+  PlayTone(TONE_D4,  400); Wait(500);
+  PlayTone(TONE_C4,  800); Wait(800);
+  Release(game.play_mutex);
+}
+
+void scoreUpTone(){
+  //TextOut(5, LCD_LINE2, "**** GAME OVER *****");
+  Acquire(game.play_mutex);
+  PlayTone(TONE_C4,50); Wait(55);
+  PlayTone(TONE_E4,50); Wait(55);
+  PlayTone(TONE_G4,50); Wait(55);
+  PlayTone(TONE_C5,50); Wait(55);
+  Release(game.play_mutex);
+}
+
+
+void ballDownTone(){
+  Acquire(game.play_mutex);
+  Wait(100);
+  PlayTone(TONE_D4,50); Wait(55);
+  PlayTone(TONE_C4,50); Wait(55);
+  Wait(100);
+  Release(game.play_mutex);
+}
+
+void ballUpTone() {
+  Acquire(game.play_mutex);
+  PlayTone(TONE_C4,200); Wait(55);
+  PlayTone(TONE_E4,200); Wait(55);
+  PlayTone(TONE_G4,200); Wait(55);
+  PlayTone(TONE_C5,200); Wait(55);
+  PlayTone(TONE_E5,200); Wait(55);
+  PlayTone(TONE_G5,200); Wait(55);
+  PlayTone(TONE_C6,200); Wait(200);
+  Release(game.play_mutex);
+}
+
+task music() {
+  while(game.playing) {
+    playMusic(music_tones, music_durations, music_waits, music_size);
+  }
+}
+
+task displayData(){
+  long last_score     = -1;
+  long last_num_balls = -1;
+  while(game.playing){
+    Acquire(game.data_mutex);
+    long score = game.score;
+    long num_balls = game.num_balls;
+    Release(game.data_mutex);
+    if (last_num_balls > -1 &&
+        num_balls > last_num_balls) displayFlashScreen();
+    if(score!=last_score){
+      ClearLine(LCD_LINE5);
+      ClearLine(LCD_LINE4);
+      ClearLine(LCD_LINE3);
+      string score_str = NumToStr(score);
+      printString(score_str, 0,30,0);
+      last_score = score;
+    }
+    if(num_balls!=last_num_balls){
+      string num_balls_str = NumToStr(num_balls);
+      RectOut(70,0,30,15, DRAW_OPT_CLEAR | DRAW_OPT_FILL_SHAPE);
+      printString(num_balls_str, 70,0,0);
+      last_num_balls =num_balls;
+
+    }
+  }
+
+}
+// La tarea del slide esta ejecutandose constantemente. Se mide cual
+// fue el tick del ultimo evento, de manera que cuando se supera
+// TIME_TO_STOP_SLIDE se para el motor correspondiente. Si llega el
+// evento y no se ha llegado a completar TIME_TO_STOP_SLIDE ticks,
+// entonces se cambia la direccion del motor, y se modifica la
+// variable last_tick para que tenga en cuenta que el motor solo estara
+// encendido la parte restante a TIME_TO_STOP_SLIDE que sobre de los
+// ticks que en realidad han passado
+task slideLeft() {
+  long max_rot_count = -MAX_SLIDE_ROT;
+  while(game.playing) {
+    if (Sensor(LEFT_SLIDE)) {
+      if (!game.left_slide) {
+	// se produce un evento de pulsacion
+	SlideDown(LEFT_SLIDE_M);
+      }
+      game.left_slide = true;
+    }
+    else {
+      if (game.left_slide) {
+	// se produce un evento de soltar el boton
+	SlideUp(LEFT_SLIDE_M);
+      }
+      game.left_slide = false;
+    }
+    // si han pasado mas de TIME_TO_STOP_SLIDE ticks, se para el motor
+    long rot = MotorRotationCount(LEFT_SLIDE_M);
+    if (( game.left_slide && rot <= max_rot_count) ||
+	(!game.left_slide && rot >= 0))
+      Off(LEFT_SLIDE_M);
+  }
+  Off(LEFT_SLIDE_M);
+}
+
+// IDEM que el anterior, pero para el otro slide
+task slideRight() {
+  long max_rot_count = MAX_SLIDE_ROT;
+  while(game.playing) {
+    if (Sensor(RIGHT_SLIDE)) {
+      if (!game.right_slide) {
+	// se produce un evento de pulsacion
+	SlideUp(RIGHT_SLIDE_M);
+      }
+      game.right_slide = true;
+    }
+    else {
+      if (game.right_slide) {
+	// se produce un evento de soltar el boton
+	SlideDown(RIGHT_SLIDE_M);
+      }
+      game.right_slide = false;
+    }
+    // si han pasado mas de TIME_TO_STOP_SLIDE ticks, se para el motor
+    long rot = MotorRotationCount(RIGHT_SLIDE_M);
+    if (( game.right_slide && rot >= max_rot_count) ||
+	(!game.right_slide && rot <= 0))
+      Off(RIGHT_SLIDE_M);
+  }
+  Off(RIGHT_SLIDE_M);
+}
+
+
+
+// se encarga de controlar el contador de puntos
+task controlScore() {
+  int valRed, valBlue, valGreen;
+  while(game.playing){
+    // leemos el sensor de color para identificar la pelota. cuando
+    // esta se encuentra lo suficientemente cerca, se marcan los puntos
+    valRed   = ColorSensorValue(S1, INPUT_RED);
+    valBlue  = ColorSensorValue(S1, INPUT_BLUE);
+    valGreen = ColorSensorValue(S1, INPUT_GREEN);
+    
+    // COLOR_THRESHOLD controla lo cerca que esta la bola
+    if (valRed   > COLOR_THRESHOLD &&
+	valGreen > COLOR_THRESHOLD &&
+	valBlue  > COLOR_THRESHOLD) {
+      if (!game.score_sensor) {
+	// puntua
+	Acquire(game.data_mutex);
+	game.score += 5;
+	if(game.score % EXTRA_BALL_SCORE == 0) {
+	  // nos da una bola extra
+	  game.num_balls++;
+	  Release(game.data_mutex);
+	  ballUpTone();
+	}
+	else {
+	  Release(game.data_mutex);
+	  scoreUpTone();
+	}
+      }
+      game.score_sensor = true;
+    }
+    else game.score_sensor = false;
+  }
+  
+}
+
+void displayBombAnimation(){
+  ClearScreen();
+  int i=1;
+  for(int j=0; j<5; ++j){
+    if( (i=-i) <0)
+      GraphicOut(0,0, "boom.ric");
+    else
+      GraphicOut(0,0, "boom2.ric");
+    Wait(150);
+  }
+}
+
+void displayScore(){
+  ClearScreen();
+  string score_str = NumToStr(game.score);
+  printString(score_str, 0,30,0);
+  printString("SCORE", 0,50,0);
+}
+// controla el sensor de luz que mide si hemos perdido la pelota, y
+// tambien el fin del juego
+task controlGameOver() {
+  while(1) {
+    Acquire(game.data_mutex);
+    if (game.num_balls == 0) {
+      // cuando el numero de bolas llega a 0, el juego se termina
+      Release(game.data_mutex);
+      break;
+    }
+    Release(game.data_mutex);
+    if(Sensor(GAME_OVER_SENSOR) > THRESHOLD && !game.game_over_sensor){
+      // se ha detectado la pelota en el sensor
+      Acquire(game.data_mutex);
+      --game.num_balls;
+      Release(game.data_mutex);
+      ballDownTone();
+    }
+    game.game_over_sensor = (Sensor(GAME_OVER_SENSOR) > THRESHOLD);
+  }
+  game.playing = false;
+  displayBombAnimation();
+
+  gameOverTone();
+  displayScore();
+  while(1);
+}
+
+
+task rotationThing() {
+  long next_tick = 0;
+  while(game.playing) {
+    if (CurrentTick() > next_tick) {
+      next_tick = 1000 + CurrentTick() + Random(5000);
+      OnFwd(ROTATION_THING, Random(100));
+    }
+  }
+  Off(ROTATION_THING);
+}
+
+task main(){
+  SetSensorColorFull(SCORE_SENSOR);
+  SetSensorTouch(LEFT_SLIDE);
+  SetSensorTouch(RIGHT_SLIDE);
+  SetSensorLight(GAME_OVER_SENSOR);
+  SetSensorMode(GAME_OVER_SENSOR, SENSOR_MODE_PERCENT);
+  initGame();
+  
+  ClearScreen();
+
+  printString("SCORE", 0,50,0);
+  printString("BALLS", 0,0, 0);
+
+  
+  Precedes(slideRight, slideLeft, controlScore, controlGameOver,
+	   displayData, music, rotationThing);
+
+}

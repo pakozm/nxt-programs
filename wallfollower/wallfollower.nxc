@@ -1,0 +1,461 @@
+// AUTHORS: Joan Climent Ciscar, Francisco Zamora Martinez
+// YEAR:    2011
+// distancias de COCO en Barrio Sesamo
+#define MUY_LEJOS  30
+#define LEJOS      22
+#define CERCA      18
+#define MUY_CERCA  10
+
+#define ULTRASOUND       IN_1
+#define ULTRASOUND_FRONT IN_4
+
+// cm por cada grado en el giro de las ruedas
+#define CM_DEGREE       20
+#define UMBRAL_FRONTAL 300 // en grados de rotacion
+
+// Estados del robot
+#define SIGO_PARED      1
+#define BUSCO_PARED     2	// de momento no se usa
+#define ACERCANDOME     3
+#define ALEJANDOME      4
+#define GIRO_90         5
+#define DESPUES_GIRO_90 6
+#define PARED_FRONTAL   7
+#define GIRO_90		5
+
+// Es el periodo con el que se van a leer los datos del sensor
+#define PERIODO_VISUALIZACION MS_200
+
+// Es el periodo con el que se van a leer los datos del sensor
+#define PERIODO_MUESTREO	MS_10
+// Numero de muestras que se usan para calcular la pendiente
+#define MAX_DISTANCIAS		7
+#define MAX_HISTORICO		70
+
+// Tiempo que obligamos al robot a hacia adelante despues de haber
+// realizado un giro
+#define TIEMPO_DESPUES_GIRO     MS_100
+#define VUELTAS_ANTES_GIRO_90   250
+#define VUELTAS_DESPUES_GIRO_90 300
+
+// Para los pitidos del RADAR
+#define MAX_TIME      3000   // MAX tiempo entre pitidos
+#define NORMAL_TIME   1000.0 // Tiempo entre pitidos en el intervalo
+			     // [CERCA, LEJOS]
+
+#define NORMAL_TONE   1000
+#define HIGH_TONE     1400
+#define LOW_TONE       600
+
+#define RIGHT_MOTOR		OUT_B
+#define LEFT_MOTOR		OUT_A
+#define BOTH_MOTORS		OUT_AB
+
+#define PENDIENTE_ZERO   0.003  // valor de pendiente que se considera cero
+#define HI_SPEED        50      // velocidad maxima
+#define LOW_SPEED       30      // velocidad minima
+
+#define TURN_SPEED	 40	// Velocidad en los giros
+#define TURN_DEGREE	 30	// Controla la duracion del giro
+#define TURN_STEER	-50	// Controla el espacio necesario para girar
+
+#define turn(direction, degree)	do {					\
+    Off(BOTH_MOTORS);							\
+    RotateMotorEx(BOTH_MOTORS, TURN_SPEED, TURN_DEGREE, TURN_STEER*sign(direction), true, true); \
+  } while(0);
+
+// variables globales
+int estado;
+float cur;
+long  cur_rot;
+float pendiente;
+
+// variables que necesitan exclusion mutua con el mutex //
+float	predicted_frontal_crash_rotation;
+int	current_speed;
+mutex	data_mutex, play_mutex;
+int	pos	 = 0;
+int	distancias[MAX_DISTANCIAS];
+long	rotations[MAX_DISTANCIAS];
+int	historico[MAX_HISTORICO];
+long	hist_rotations[MAX_HISTORICO];
+int	hist_pos = 0;
+
+//////////////////////////////////////////////////////////
+
+// devuelve el ultimo valor leido del sensor
+int get_last() {
+  int aux;
+  // necesita cerrar el mutex
+  Acquire(data_mutex);
+  // calcula la posicion en el vector del ultimo
+  int p = (MAX_DISTANCIAS + pos - 1) % MAX_DISTANCIAS;
+  // se lo guarda
+  aux = distancias[p];
+  // libera el semaforo
+  Release(data_mutex);
+  // devuelve el valor guardado
+  return aux;
+}
+
+task buscar_pared()
+{
+
+}
+
+// se encarga de hacer el RADAR
+task pitido()
+{
+  long last_tick = CurrentTick();
+  PlayTone(440, 200); // pitido inicial (LARGO)
+  while(1) {
+    Wait(MS_1);
+    float cur_copy = get_last();
+    long  tick     = CurrentTick();
+    int time, tone;
+    if (cur_copy > LEJOS) {
+      // si esta lejos emitimos un sonido grave
+      int diff = cur_copy - LEJOS;
+      tone     = LOW_TONE;
+      // y lento
+      time     = NORMAL_TIME + diff * 15;
+    }
+    else if (cur_copy < CERCA) {
+      // si esta cerca emitimos un sonido agudo
+      tone = HIGH_TONE;
+      // y cada vez mas rapido
+      time = cur_copy * NORMAL_TIME/CERCA;
+    }
+    else {
+      // en otro caso emitimos el sonido A4 y a tiempo normal
+      tone = NORMAL_TONE;
+      time = NORMAL_TIME;
+    }
+    // Limite temporal
+    if (time > MAX_TIME) time = MAX_TIME;
+    if (tick - last_tick > time) {
+      // Emitimos el sonido solo cuando toque
+      Acquire(play_mutex);
+      PlayTone(tone, 50);
+      Release(play_mutex);
+      last_tick = tick;
+    }
+  }
+}
+
+// f(x) = a + b*x
+//
+//      n*sum(xi*yi) - (sum(xi)*sum(yi))
+// b = --------------------------------
+//      n*sum(xi^2) - (sum(xi))^2
+//
+// a = sum(yi)/n - b*(sum(xi)/n)
+float calcular_pendiente() {
+  float sum_xi=0, sum_yi=0, sum_xi_2=0, sum_xi_yi=0, a, b;
+  int p;
+  Acquire(data_mutex);
+  p = pos;
+  for (int i=0; i<MAX_DISTANCIAS; ++i) {
+    sum_xi    += rotations[p];
+    sum_yi    += distancias[p];
+    sum_xi_2  += rotations[p]*rotations[p];
+    sum_xi_yi += distancias[p]*rotations[p];
+    cur_rot    = rotations[p];
+    p          = (p+1) % MAX_DISTANCIAS;
+  }
+  //cur = distancias[(MAX_DISTANCIAS - p - 1) % MAX_DISTANCIAS];
+  Release(data_mutex);
+  b   = (MAX_DISTANCIAS*sum_xi_yi - sum_xi*sum_yi)/(MAX_DISTANCIAS*sum_xi_2 - sum_xi*sum_xi);
+  // a =(sum_yi/MAX_DISTANCIAS) - b*(sum_xi/MAX_DISTANCIAS);
+  cur = sum_yi / MAX_DISTANCIAS;
+  return b;
+}
+
+float calcular_pendiente_hist() {
+  float sum_xi=0, sum_yi=0, sum_xi_2=0, sum_xi_yi=0, a, b;
+  int p, k=0;
+  Acquire(data_mutex);
+  p = hist_pos;
+  long last_rotation = 0;
+  for (int i=0; i<MAX_HISTORICO; ++i) {
+    if (historico[i] < MUY_LEJOS && last_rotation != hist_rotations[p]) {
+      last_rotation = hist_rotations[p];
+      sum_xi       += hist_rotations[p];
+      sum_yi       += historico[p];
+      sum_xi_2     += hist_rotations[p]*hist_rotations[p];
+      sum_xi_yi    += historico[p]*hist_rotations[p];
+      ++k;
+    }
+    p = (p+1) % MAX_HISTORICO;
+  }
+  Release(data_mutex);
+  if (k > 2)
+    b   = (k*sum_xi_yi - sum_xi*sum_yi)/(k*sum_xi_2 - sum_xi*sum_xi);
+  else b = 0;
+  // a =(sum_yi/MAX_DISTANCIAS) - b*(sum_xi/MAX_DISTANCIAS);
+  return b;
+}
+
+// proceso que se encarga de leer del sensor
+task lectura_de_distancias()
+{
+  long t;
+  int aux = SensorUS(ULTRASOUND);
+  Acquire(data_mutex);
+  for (int i=0; i<MAX_DISTANCIAS; ++i) {
+    distancias[i] = aux;
+    rotations[i]  = 0;
+  }
+  for (int i=0; i<MAX_HISTORICO; ++i) {
+    historico[i]       = aux;
+    hist_rotations[i]  = 0;
+  }
+  
+  hist_pos           = 0;
+  pos		     = 0;
+  Release(data_mutex);
+  int	wpos	     = 0;
+  while(1) {
+    t			     = CurrentTick();
+    Acquire(data_mutex);
+    long	rotation_R   = MotorRotationCount(RIGHT_MOTOR);
+    long	rotation_L   = MotorRotationCount(LEFT_MOTOR);
+    distancias[pos]	     = SensorUS(ULTRASOUND);
+    rotations[pos]	     = (rotation_L + rotation_R) / 2.0;
+    historico[hist_pos]	     = distancias[pos];
+    hist_rotations[hist_pos] = rotations[pos];
+    pos			     = (pos + 1)      % MAX_DISTANCIAS;
+    hist_pos		     = (hist_pos + 1) % MAX_HISTORICO;
+    Release(data_mutex);
+    t			     = CurrentTick() - t;
+    if (t < PERIODO_MUESTREO) Wait(PERIODO_MUESTREO - t);
+  }
+}
+
+
+// proceso que se encarga de leer del sensor
+task dibujar_distancias()
+{
+  long t;
+  DrawRectType drArgs;
+  int LIMIT     = 70;
+  int RECTWIDTH = LIMIT / MAX_DISTANCIAS;
+  while(1) {
+    Acquire(data_mutex);
+    int p = pos;
+    int wpos = 0;
+    for (int i=0; i<MAX_DISTANCIAS; ++i) {
+      drArgs.Location.X  = wpos;
+      drArgs.Location.Y  = LCD_LINE8;
+      drArgs.Size.Width  = RECTWIDTH;
+      drArgs.Size.Height = (distancias[p] < 30) ? distancias[p] : 30;
+      //      drArgs.Size.Height = (rotations[p]/100 < 30) ? rotations[p]/100 : 30;
+      drArgs.Options = 0x00; // do not clear before drawing
+      SysDrawRect(drArgs);
+      wpos += RECTWIDTH + 1;
+      p = (p+1) % MAX_DISTANCIAS;
+    }
+    Release(data_mutex);
+    Wait(PERIODO_VISUALIZACION);
+    ClearLine(LCD_LINE5);
+    ClearLine(LCD_LINE6);
+    ClearLine(LCD_LINE7);
+    ClearLine(LCD_LINE8);
+  }
+}
+
+
+void read_front() {
+  Acquire(data_mutex);
+  // desconectamos el sensor lateral
+  I2CWrite(ULTRASOUND, 0x41, 0x00);
+  // conectamos el sensor frontal
+  I2CWrite(ULTRASOUND_FRONT, 0x41, 0x03);
+  long distancia_frontal = 0;
+  int i;
+  // leemos 3 muestras
+  for (i=0; i<3; ++i) {
+    Wait(PERIODO_MUESTREO);
+    distancia_frontal += SensorUS(ULTRASOUND_FRONT);
+  }
+  // calculamos el momento en que se producira el choque a partir de
+  // la distancia leida del sensor
+  predicted_frontal_crash_rotation = (distancia_frontal * CM_DEGREE / i+
+				      rotations[(MAX_DISTANCIAS - pos - 1) %
+						MAX_DISTANCIAS]);
+  // desconectamos el sensor frontal
+  I2CWrite(ULTRASOUND_FRONT, 0x41, 0x00);
+  // esperamos para evitar interferencias
+  Wait(MS_50);
+  // conectamos el sensor lateral
+  I2CWrite(ULTRASOUND, 0x41, 0x03);
+  Wait(MS_10);
+  Release(data_mutex);
+}
+
+task read_front_task() {
+  while(1) {
+    read_front();
+    // esperamos para volver a leer
+    Wait(MS_200);
+  }
+}
+
+void reset_window() {
+  Acquire(data_mutex);
+  predicted_frontal_crash_rotation = 100000;
+  ResetRotationCount(BOTH_MOTORS);
+  long aux = SensorUS(ULTRASOUND);
+  for (int i=0; i<MAX_DISTANCIAS; ++i) {
+    distancias[i] = aux;
+    rotations[i]  = 0;
+  }
+  
+  for (int i=0; i<MAX_HISTORICO; ++i) {
+    historico[i]      = aux;
+    hist_rotations[i] = 0;
+  }
+
+  Release(data_mutex);
+}
+
+int transitar(int estado, float cur, float pendiente) {
+  if (predicted_frontal_crash_rotation - cur_rot < UMBRAL_FRONTAL)
+    estado = PARED_FRONTAL;
+  else {
+    switch(estado) {
+    case GIRO_90:
+      estado = DESPUES_GIRO_90;
+      break;
+    case DESPUES_GIRO_90:
+      if (cur_rot > VUELTAS_DESPUES_GIRO_90) {
+	calcular_pendiente();
+	if (cur < MUY_LEJOS) estado = SIGO_PARED;
+      }
+      break;
+    default:
+      // Si pendiente < 0 estamos acercandonos
+      // Si pendiente > 0 estamos alejandonos
+      // estamos cerca, y estamos acercandonos, hay que cambiar de direccion
+      if( cur<CERCA && pendiente < -PENDIENTE_ZERO) estado = ACERCANDOME;
+      // estamos demasiado lejos, hemos llegado
+      else if( cur>= MUY_LEJOS) estado = GIRO_90;
+      // estamos lejos, y estamos alejandonos, hay que cambiar de direccion
+      else if( cur>LEJOS && pendiente > PENDIENTE_ZERO) estado = ALEJANDOME;
+      // en otro caso, seguimos recto
+      else estado = SIGO_PARED;
+    }
+  }
+  return estado;
+}
+
+void pared_frontal() {
+  reset_window();
+  Off(BOTH_MOTORS);
+  // Hacia detras
+  RotateMotorEx(BOTH_MOTORS, -50, 90, 0, true, true);
+  // giramos el robot
+  RotateMotorEx(BOTH_MOTORS, TURN_SPEED, 185, 100, true, true);
+  // avanzamos
+  OnFwdReg(BOTH_MOTORS, current_speed,  OUT_REGMODE_SPEED);
+}
+
+
+void giro_90() {
+  // calculamos el angulo de la direccion del robot y la pared
+  float pendiente_hist = calcular_pendiente_hist();
+  float angulo         = abs(atan(pendiente_hist) * 180/PI);
+  // avanzamos un poco
+  RotateMotorEx(BOTH_MOTORS, 50, VUELTAS_ANTES_GIRO_90, 0, true, true);
+  Off(BOTH_MOTORS);
+  // le suamos 90 grados para hacer el giro de 90
+  if      (pendiente_hist < -PENDIENTE_ZERO) angulo = 90 - angulo;
+  else if (pendiente_hist >  PENDIENTE_ZERO) angulo = 90 + angulo;
+  else angulo = 90;
+  if (angulo > 100) angulo = 90;
+  ClearLine(LCD_LINE1);
+  NumOut(5, LCD_LINE1, angulo);
+  ClearLine(LCD_LINE2);
+  NumOut(5, LCD_LINE2, pendiente_hist);
+  // giramos el robot
+  RotateMotorEx(BOTH_MOTORS, TURN_SPEED, 1.6*angulo, -100, true, true);
+  // ponemos los motores en marcha
+  OnFwdReg(BOTH_MOTORS, current_speed,  OUT_REGMODE_SPEED);
+}
+
+// control del robot
+task control() {
+  // velocidad
+  current_speed = HI_SPEED;
+  // espera inicial
+  Wait( PERIODO_MUESTREO );
+  while( 1 ){
+    // movemos hacia adelante, regulando la velocidad para evitar que
+    // se desvie
+    OnFwdReg( BOTH_MOTORS, current_speed, OUT_REGMODE_SPEED);
+    switch(estado) {
+    case PARED_FRONTAL:
+    case SIGO_PARED:
+      Wait( PERIODO_MUESTREO ); break;
+    default:
+      Wait(TIEMPO_DESPUES_GIRO);
+    }
+    // calcula la pendiente en funcion de lecturas anteriores, y pone
+    // el ultimo dato en cur
+    pendiente = calcular_pendiente();
+    ClearLine(LCD_LINE3); NumOut(5, LCD_LINE3, predicted_frontal_crash_rotation);
+    ClearLine(LCD_LINE4); NumOut(5, LCD_LINE4, cur_rot);
+    // procesamos el cambio de estado (transitamos en el automata)
+    estado = transitar(estado, cur, pendiente);
+    // cambiamos la velocidad
+    current_speed = LOW_SPEED;
+    switch( estado ){
+    case DESPUES_GIRO_90:
+      // avanzamos hasta que encuentre la pared de nuevo
+      break;
+    case PARED_FRONTAL:
+      ClearLine(LCD_LINE2);
+      TextOut(5, LCD_LINE2, "pared frontal");
+      pared_frontal();
+      reset_window();
+      break;
+    case SIGO_PARED:
+      //sigue recto
+      ClearLine(LCD_LINE2);
+      TextOut(5, LCD_LINE2, "sigo Pared");
+      current_speed = HI_SPEED;
+      break;
+    case BUSCO_PARED:
+      //              buscar_pared();
+      break;
+    case ACERCANDOME:
+      ClearLine(LCD_LINE2);
+      TextOut(5, LCD_LINE2, "acercandome");
+      turn( -1, abs(atan(pendiente)) );
+      break;
+    case ALEJANDOME:
+      ClearLine(LCD_LINE2);
+      TextOut(5, LCD_LINE2, "alejandome");
+      turn( 1, abs(atan(pendiente)) );
+      break;
+    case GIRO_90:
+      ClearLine(LCD_LINE2);
+      TextOut(5, LCD_LINE2, "giro 90º");
+      giro_90();
+      reset_window();
+      break;
+    }
+  }
+}
+
+task main(){
+  SetSensorLowspeed(ULTRASOUND);
+  SetSensorLowspeed(ULTRASOUND_FRONT);
+  I2CWrite(ULTRASOUND_FRONT, 0x41, 0x00);
+  predicted_frontal_crash_rotation = 100000;
+  Wait(2000);
+  cur = SensorUS(ULTRASOUND);
+  estado = SIGO_PARED;
+  ResetRotationCount(BOTH_MOTORS);
+  Precedes(read_front_task, lectura_de_distancias, control, dibujar_distancias);
+}
